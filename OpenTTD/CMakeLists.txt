@@ -372,7 +372,7 @@ if(EMSCRIPTEN)
     add_definitions(-s DISABLE_EXCEPTION_CATCHING=0)
 
     # Export functions to Javascript.
-    target_link_libraries(WASM::WASM INTERFACE "-s EXPORTED_FUNCTIONS='[\"_main\", \"_em_openttd_add_server\", \"_em_openttd_console\", \"_em_openttd_state\"]' -s EXPORTED_RUNTIME_METHODS='[\"cwrap\", \"HEAPU8\", \"ccall\", \"UTF8ToString\"]'")
+    target_link_libraries(WASM::WASM INTERFACE "-s EXPORTED_FUNCTIONS='[\"_main\", \"_em_openttd_add_server\", \"_em_openttd_action\", \"_em_openttd_console\", \"_em_openttd_state\"]' -s EXPORTED_RUNTIME_METHODS='[\"cwrap\", \"HEAPU8\", \"ccall\", \"UTF8ToString\"]'")
 
     # Preload all the files we generate during build.
     # As we do not compile with FreeType / FontConfig, we also have no way to
@@ -408,6 +408,12 @@ if(EMSCRIPTEN)
     # bootstrap. CI / local build scripts place the extracted files in vendor/baseset.
     if(EXISTS "${CMAKE_SOURCE_DIR}/vendor/baseset/opengfx.obg")
         target_link_libraries(WASM::WASM INTERFACE "--preload-file ${CMAKE_SOURCE_DIR}/vendor/baseset@/baseset")
+    endif()
+
+    # Bundle the RemoteControl placeholder AI used for browser agent-vs-agent
+    # battles (an external controller drives its companies via the WASM bridge).
+    if(EXISTS "${CMAKE_SOURCE_DIR}/vendor/ai/RemoteControl/info.nut")
+        target_link_libraries(WASM::WASM INTERFACE "--preload-file ${CMAKE_SOURCE_DIR}/vendor/ai/RemoteControl@/ai/RemoteControl")
     endif()
 
     # We use IDBFS for persistent storage.

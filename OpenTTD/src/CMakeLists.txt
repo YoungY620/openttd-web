@@ -606,5 +606,8 @@ add_files(
 )
 
 if(EMSCRIPTEN)
-    target_sources(openttd PRIVATE emscripten/kimi_bridge.cpp)
+    target_sources(openttd PRIVATE
+        emscripten/kimi_actions.cpp
+        emscripten/kimi_bridge.cpp
+    )
 endif()

@@ -2,4 +2,4 @@ build/
 build-host/
 site/
 dist/
-OpenTTD/vendor/
+OpenTTD/vendor/baseset/
