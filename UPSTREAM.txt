@@ -1,0 +1,2 @@
+713994a0d62abb5bd47d67af04b52bf86527743d 2026-08-17 Update: Translations from eints
+https://github.com/OpenTTD/OpenTTD

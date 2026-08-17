@@ -1,0 +1,74 @@
+/*
+ * This file is part of OpenTTD.
+ * OpenTTD is free software; you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, version 2.
+ * OpenTTD is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details. You should have received a copy of the GNU General Public License along with OpenTTD. If not, see <https://www.gnu.org/licenses/old-licenses/gpl-2.0>.
+ */
+
+/** @file depot_sl.cpp Code handling saving and loading of depots. */
+
+#include "../stdafx.h"
+
+#include "saveload.h"
+#include "compat/depot_sl_compat.h"
+
+#include "../depot_base.h"
+#include "../town.h"
+
+#include "../safeguards.h"
+
+static TownID _town_index;
+
+static const SaveLoad _depot_desc[] = {
+	 SLE_CONDVAR(Depot, xy, VarFileType::U16 | VarMemType::U32, SaveLoadVersion::MinVersion, SaveLoadVersion::MultipleRoadStops),
+	 SLE_CONDVAR(Depot, xy, VarTypes::U32, SaveLoadVersion::MultipleRoadStops, SaveLoadVersion::MaxVersion),
+	SLEG_CONDVAR("town_index", _town_index, VarTypes::U16, SaveLoadVersion::MinVersion, SaveLoadVersion::UniqueDepotNames),
+	 SLE_CONDREF(Depot, town, SLRefType::Town, SaveLoadVersion::UniqueDepotNames, SaveLoadVersion::MaxVersion),
+	 SLE_CONDVAR(Depot, town_cn, VarTypes::U16, SaveLoadVersion::UniqueDepotNames, SaveLoadVersion::MaxVersion),
+	SLE_CONDSSTR(Depot, name, VarTypes::STR, SaveLoadVersion::UniqueDepotNames, SaveLoadVersion::MaxVersion),
+	 SLE_CONDVAR(Depot, build_date, VarTypes::I32, SaveLoadVersion::NewGRFDepotBuildDate, SaveLoadVersion::MaxVersion),
+};
+
+struct DEPTChunkHandler : ChunkHandler {
+	DEPTChunkHandler() : ChunkHandler("DEPT", ChunkType::Table) {}
+
+	void Save() const override
+	{
+		SlTableHeader(_depot_desc);
+
+		for (Depot *depot : Depot::Iterate()) {
+			SlSetArrayIndex(depot->index);
+			SlObject(depot, _depot_desc);
+		}
+	}
+
+	void Load() const override
+	{
+		const std::vector<SaveLoad> slt = SlCompatTableHeader(_depot_desc, _depot_sl_compat);
+
+		int index;
+
+		while ((index = SlIterateArray()) != -1) {
+			Depot *depot = Depot::CreateAtIndex(DepotID(index));
+			SlObject(depot, slt);
+
+			/* Set the town 'pointer' so we can restore it later. */
+			if (IsSavegameVersionBefore(SaveLoadVersion::UniqueDepotNames)) depot->town = reinterpret_cast<Town *>(static_cast<size_t>(_town_index.base()));
+		}
+	}
+
+	void FixPointers() const override
+	{
+		for (Depot *depot : Depot::Iterate()) {
+			SlObject(depot, _depot_desc);
+			if (IsSavegameVersionBefore(SaveLoadVersion::UniqueDepotNames)) depot->town = Town::Get((size_t)depot->town);
+		}
+	}
+};
+
+static const DEPTChunkHandler DEPT;
+static const ChunkHandlerRef depot_chunk_handlers[] = {
+	DEPT,
+};
+
+extern const ChunkHandlerTable _depot_chunk_handlers(depot_chunk_handlers);

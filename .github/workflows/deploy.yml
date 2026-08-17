@@ -1,0 +1,78 @@
+name: Build & Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: emscripten/emsdk:6.0.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install liblzma emscripten port
+        run: cp OpenTTD/os/emscripten/ports/liblzma.py /emsdk/upstream/emscripten/tools/ports/contrib/liblzma.py
+
+      - name: Download base assets (OpenGFX, OpenSFX)
+        run: |
+          set -e
+          mkdir -p OpenTTD/vendor/baseset
+          curl -fsSL -o /tmp/opengfx.zip https://cdn.openttd.org/opengfx-releases/7.1/opengfx-7.1-all.zip
+          python3 -c "import zipfile; zipfile.ZipFile('/tmp/opengfx.zip').extractall('/tmp/opengfx')"
+          tar -C /tmp -xf /tmp/opengfx/opengfx-7.1.tar
+          cp /tmp/opengfx-7.1/* OpenTTD/vendor/baseset/
+          curl -fsSL -o /tmp/opensfx.zip https://cdn.openttd.org/opensfx-releases/1.0.3/opensfx-1.0.3-all.zip
+          python3 -c "import zipfile; zipfile.ZipFile('/tmp/opensfx.zip').extractall('/tmp/opensfx')"
+          tar -C /tmp -xf /tmp/opensfx/opensfx-1.0.3.tar
+          cp /tmp/opensfx-1.0.3/* OpenTTD/vendor/baseset/
+          ls -la OpenTTD/vendor/baseset/
+
+      - name: Build host tools
+        run: |
+          cmake -S OpenTTD -B build-host -DOPTION_TOOLS_ONLY=ON
+          cmake --build build-host -j "$(nproc)" --target tools
+
+      - name: Build WASM game
+        run: |
+          emcmake cmake -S OpenTTD -B build \
+            -DHOST_BINARY_DIR="$PWD/build-host" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOPTION_USE_ASSERTS=OFF
+          cmake --build build -j "$(nproc)" --target openttd
+
+      - name: Assemble site
+        run: |
+          mkdir -p dist
+          cp build/openttd.html dist/index.html
+          cp build/openttd.js build/openttd.wasm build/openttd.data dist/
+          cp OpenTTD/os/emscripten/kimi.js dist/
+          touch dist/.nojekyll
+          ls -la dist/
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

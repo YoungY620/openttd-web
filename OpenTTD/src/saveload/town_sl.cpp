@@ -1,0 +1,436 @@
+/*
+ * This file is part of OpenTTD.
+ * OpenTTD is free software; you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, version 2.
+ * OpenTTD is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details. You should have received a copy of the GNU General Public License along with OpenTTD. If not, see <https://www.gnu.org/licenses/old-licenses/gpl-2.0>.
+ */
+
+/** @file town_sl.cpp Code handling saving and loading of towns and houses. */
+
+#include "../stdafx.h"
+
+#include "saveload.h"
+#include "compat/town_sl_compat.h"
+
+#include "newgrf_sl.h"
+#include "../newgrf_house.h"
+#include "../town.h"
+#include "../landscape.h"
+#include "../subsidy_func.h"
+#include "../strings_func.h"
+#include "../misc/history_func.hpp"
+
+#include "../safeguards.h"
+
+/**
+ * Rebuild all the cached variables of towns.
+ */
+void RebuildTownCaches()
+{
+	InitializeBuildingCounts();
+	RebuildTownKdtree();
+
+	/* Reset town population and num_houses */
+	for (Town *town : Town::Iterate()) {
+		town->cache.population = 0;
+		town->cache.num_houses = 0;
+	}
+
+	for (const auto t : Map::Iterate()) {
+		if (!IsTileType(t, TileType::House)) continue;
+
+		HouseID house_id = GetHouseType(t);
+		Town *town = Town::GetByTile(t);
+		IncreaseBuildingCount(town, house_id);
+		if (IsHouseCompleted(t)) town->cache.population += HouseSpec::Get(house_id)->population;
+
+		/* Increase the number of houses for every house, but only once. */
+		if (GetHouseNorthPart(house_id) == TileDiffXY(0, 0)) town->cache.num_houses++;
+	}
+
+	/* Update the population and num_house dependent values */
+	for (Town *town : Town::Iterate()) {
+		UpdateTownRadius(town);
+	}
+}
+
+/**
+ * Check and update town and house values.
+ *
+ * Checked are the HouseIDs. Updated are the
+ * town population the number of houses per
+ * town, the town radius and the max passengers
+ * of the town.
+ */
+void UpdateHousesAndTowns()
+{
+	for (const auto t : Map::Iterate()) {
+		if (!IsTileType(t, TileType::House)) continue;
+
+		HouseID house_id = GetCleanHouseType(t);
+		if (!HouseSpec::Get(house_id)->enabled && house_id >= NEW_HOUSE_OFFSET) {
+			/* The specs for this type of house are not available any more, so
+			 * replace it with the substitute original house type. */
+			house_id = _house_mngr.GetSubstituteID(house_id);
+			SetHouseType(t, house_id);
+		}
+	}
+
+	/* Check for cases when a NewGRF has set a wrong house substitute type. */
+	for (const TileIndex &t : Map::Iterate()) {
+		if (!IsTileType(t, TileType::House)) continue;
+
+		HouseID house_type = GetCleanHouseType(t);
+		TileIndex north_tile = t + GetHouseNorthPart(house_type); // modifies 'house_type'!
+		if (t == north_tile) {
+			const HouseSpec *hs = HouseSpec::Get(house_type);
+			bool valid_house = true;
+			if (hs->building_flags.Test(BuildingFlag::Size2x1)) {
+				TileIndex tile = t + TileDiffXY(1, 0);
+				if (!IsTileType(tile, TileType::House) || GetCleanHouseType(tile) != house_type + 1) valid_house = false;
+			} else if (hs->building_flags.Test(BuildingFlag::Size1x2)) {
+				TileIndex tile = t + TileDiffXY(0, 1);
+				if (!IsTileType(tile, TileType::House) || GetCleanHouseType(tile) != house_type + 1) valid_house = false;
+			} else if (hs->building_flags.Test(BuildingFlag::Size2x2)) {
+				TileIndex tile = t + TileDiffXY(0, 1);
+				if (!IsTileType(tile, TileType::House) || GetCleanHouseType(tile) != house_type + 1) valid_house = false;
+				tile = t + TileDiffXY(1, 0);
+				if (!IsTileType(tile, TileType::House) || GetCleanHouseType(tile) != house_type + 2) valid_house = false;
+				tile = t + TileDiffXY(1, 1);
+				if (!IsTileType(tile, TileType::House) || GetCleanHouseType(tile) != house_type + 3) valid_house = false;
+			}
+			/* If not all tiles of this house are present remove the house.
+			 * The other tiles will get removed later in this loop because
+			 * their north tile is not the correct type anymore. */
+			if (!valid_house) DoClearSquare(t);
+		} else if (!IsTileType(north_tile, TileType::House) || GetCleanHouseType(north_tile) != house_type) {
+			/* This tile should be part of a multi-tile building but the
+			 * north tile of this house isn't on the map. */
+			DoClearSquare(t);
+		}
+	}
+
+	RebuildTownCaches();
+}
+
+
+class SlTownOldSupplied : public DefaultSaveLoadHandler<SlTownOldSupplied, Town> {
+public:
+	static inline const SaveLoad description[] = {
+		SLE_CONDVAR(TransportedCargoStat<uint32_t>, old_max, VarTypes::U32, SaveLoadVersion::ScriptTownGrowth, SaveLoadVersion::MaxVersion),
+		SLE_CONDVAR(TransportedCargoStat<uint32_t>, new_max, VarTypes::U32, SaveLoadVersion::ScriptTownGrowth, SaveLoadVersion::MaxVersion),
+		SLE_CONDVAR(TransportedCargoStat<uint32_t>, old_act, VarTypes::U32, SaveLoadVersion::ScriptTownGrowth, SaveLoadVersion::MaxVersion),
+		SLE_CONDVAR(TransportedCargoStat<uint32_t>, new_act, VarTypes::U32, SaveLoadVersion::ScriptTownGrowth, SaveLoadVersion::MaxVersion),
+	};
+	static inline const SaveLoadCompatTable compat_description = _town_supplied_sl_compat;
+
+	/**
+	 * Get the number of cargoes used by this savegame version.
+	 * @return The number of cargoes used by this savegame version.
+	 */
+	size_t GetNumCargo() const
+	{
+		if (IsSavegameVersionBefore(SaveLoadVersion::ExtendCargotypes)) return 32;
+		if (IsSavegameVersionBefore(SaveLoadVersion::SaveloadListLength)) return NUM_CARGO;
+		/* Read from the savegame how long the list is. */
+		return SlGetStructListLength(NUM_CARGO);
+	}
+
+	void Load(Town *t) const override
+	{
+		size_t num_cargo = this->GetNumCargo();
+		for (size_t i = 0; i < num_cargo; i++) {
+			TransportedCargoStat<uint32_t> cargo_stat;
+			SlObject(&cargo_stat, this->GetLoadDescription());
+
+			/* Ignore empty statistics. */
+			if (cargo_stat.new_act == 0 && cargo_stat.new_max == 0 && cargo_stat.old_act == 0 && cargo_stat.old_max == 0) continue;
+
+			auto &s = t->supplied.emplace_back(static_cast<CargoType>(i));
+			s.history[LAST_MONTH].production = cargo_stat.old_max;
+			s.history[LAST_MONTH].transported = cargo_stat.old_act;
+			s.history[THIS_MONTH].production = cargo_stat.new_max;
+			s.history[THIS_MONTH].transported = cargo_stat.new_act;
+		}
+	}
+};
+
+class SlTownSuppliedHistory : public DefaultSaveLoadHandler<SlTownSuppliedHistory, Town::SuppliedCargo> {
+public:
+	static inline const SaveLoad description[] = {
+		 SLE_VAR(Town::SuppliedHistory, production, VarTypes::U32),
+		 SLE_VAR(Town::SuppliedHistory, transported, VarTypes::U32),
+	};
+	static inline const SaveLoadCompatTable compat_description = {};
+
+	void Save(Town::SuppliedCargo *p) const override
+	{
+		SlSetStructListLength(p->history.size());
+
+		for (auto &h : p->history) {
+			SlObject(&h, this->GetDescription());
+		}
+	}
+
+	void Load(Town::SuppliedCargo *p) const override
+	{
+		size_t len = SlGetStructListLength(p->history.size());
+
+		for (auto &h : p->history) {
+			if (--len > p->history.size()) break; // unsigned so wraps after hitting zero.
+			SlObject(&h, this->GetLoadDescription());
+		}
+	}
+};
+
+class SlTownSupplied : public VectorSaveLoadHandler<SlTownSupplied, Town, Town::SuppliedCargo> {
+public:
+	inline static const SaveLoad description[] = {
+		SLE_VAR(Town::SuppliedCargo, cargo, VarTypes::U8),
+		SLEG_STRUCTLIST("history", SlTownSuppliedHistory),
+	};
+	inline const static SaveLoadCompatTable compat_description = {};
+
+	std::vector<Town::SuppliedCargo> &GetVector(Town *t) const override { return t->supplied; }
+};
+
+/** Saveload handler for town accepted cargo history entries. */
+class SlTownAcceptedHistory : public DefaultSaveLoadHandler<SlTownAcceptedHistory, Town::AcceptedCargo> {
+public:
+	/** Saveload description for handler. */
+	static inline const SaveLoad description[] = {
+		 SLE_VAR(Town::AcceptedHistory, accepted, VarTypes::U32),
+	};
+	/** Compatibility saveload description for handler. */
+	static inline const SaveLoadCompatTable compat_description = {};
+
+	void Save(Town::AcceptedCargo *p) const override
+	{
+		SlSetStructListLength(p->history.size());
+
+		for (auto &h : p->history) {
+			SlObject(&h, this->GetDescription());
+		}
+	}
+
+	void Load(Town::AcceptedCargo *p) const override
+	{
+		size_t len = SlGetStructListLength(p->history.size());
+
+		for (auto &h : p->history) {
+			if (--len > p->history.size()) break; // unsigned so wraps after hitting zero.
+			SlObject(&h, this->GetLoadDescription());
+		}
+	}
+};
+
+/** Saveload handler for town accepted cargo history. */
+class SlTownAccepted : public VectorSaveLoadHandler<SlTownAccepted, Town, Town::AcceptedCargo> {
+public:
+	/** Saveload description for handler. */
+	inline static const SaveLoad description[] = {
+		SLE_VAR(Town::AcceptedCargo, cargo, VarTypes::U8),
+		SLEG_STRUCTLIST("history", SlTownAcceptedHistory),
+	};
+	/** Compatibility saveload description for handler. */
+	inline const static SaveLoadCompatTable compat_description = {};
+
+	std::vector<Town::AcceptedCargo> &GetVector(Town *t) const override { return t->accepted; }
+};
+
+class SlTownReceived : public DefaultSaveLoadHandler<SlTownReceived, Town> {
+public:
+	static inline const SaveLoad description[] = {
+		SLE_CONDVAR(TransportedCargoStat<uint16_t>, old_max, VarTypes::U16, SaveLoadVersion::ScriptTownGrowth, SaveLoadVersion::MaxVersion),
+		SLE_CONDVAR(TransportedCargoStat<uint16_t>, new_max, VarTypes::U16, SaveLoadVersion::ScriptTownGrowth, SaveLoadVersion::MaxVersion),
+		SLE_CONDVAR(TransportedCargoStat<uint16_t>, old_act, VarTypes::U16, SaveLoadVersion::ScriptTownGrowth, SaveLoadVersion::MaxVersion),
+		SLE_CONDVAR(TransportedCargoStat<uint16_t>, new_act, VarTypes::U16, SaveLoadVersion::ScriptTownGrowth, SaveLoadVersion::MaxVersion),
+	};
+	static inline const SaveLoadCompatTable compat_description = _town_received_sl_compat;
+
+	void Save(Town *t) const override
+	{
+		SlSetStructListLength(std::size(t->received));
+		for (auto &received : t->received) {
+			SlObject(&received, this->GetDescription());
+		}
+	}
+
+	void Load(Town *t) const override
+	{
+		size_t length = IsSavegameVersionBefore(SaveLoadVersion::SaveloadListLength) ? to_underlying(TownAcceptanceEffect::End) : SlGetStructListLength(to_underlying(TownAcceptanceEffect::End));
+		for (size_t i = 0; i < length; i++) {
+			SlObject(&t->received[static_cast<TownAcceptanceEffect>(i)], this->GetLoadDescription());
+		}
+	}
+};
+
+class SlTownAcceptanceMatrix : public DefaultSaveLoadHandler<SlTownAcceptanceMatrix, Town> {
+private:
+	/** Compatibility struct with just enough of TileMatrix to facilitate loading. */
+	struct AcceptanceMatrix {
+		TileArea area;
+		static const uint GRID = 4;
+	};
+public:
+	static inline const SaveLoad description[] = {
+		SLE_VAR(AcceptanceMatrix, area.tile, VarTypes::U32),
+		SLE_VAR(AcceptanceMatrix, area.w,    VarTypes::U16),
+		SLE_VAR(AcceptanceMatrix, area.h,    VarTypes::U16),
+	};
+	static inline const SaveLoadCompatTable compat_description = _town_acceptance_matrix_sl_compat;
+
+	void Load(Town *) const override
+	{
+		/* Discard now unused acceptance matrix. */
+		AcceptanceMatrix dummy;
+		SlObject(&dummy, this->GetLoadDescription());
+		if (dummy.area.w != 0) {
+			uint arr_len = dummy.area.w / AcceptanceMatrix::GRID * dummy.area.h / AcceptanceMatrix::GRID;
+			SlSkipBytes(4 * arr_len);
+		}
+	}
+};
+
+static std::array<Town::SuppliedHistory, 2> _old_pass_supplied{};
+static std::array<Town::SuppliedHistory, 2> _old_mail_supplied{};
+
+static const SaveLoad _town_desc[] = {
+	SLE_CONDVAR(Town, xy, VarFileType::U16 | VarMemType::U32, SaveLoadVersion::MinVersion, SaveLoadVersion::MultipleRoadStops),
+	SLE_CONDVAR(Town, xy, VarTypes::U32, SaveLoadVersion::MultipleRoadStops, SaveLoadVersion::MaxVersion),
+
+	SLE_CONDVAR(Town, townnamegrfid, VarTypes::LABEL_REVERSE, SaveLoadVersion::NewGRFTownNames, SaveLoadVersion::MaxVersion),
+	    SLE_VAR(Town, townnametype,          VarTypes::U16),
+	    SLE_VAR(Town, townnameparts,         VarTypes::U32),
+	SLE_CONDSSTR(Town, name, VarTypes::STR | StringValidationSetting::AllowControlCode, SaveLoadVersion::ReplaceCustomNameArray, SaveLoadVersion::MaxVersion),
+
+	    SLE_VAR(Town, flags,                 VarTypes::U8),
+	SLE_CONDVAR(Town, statues, VarFileType::U8 | VarMemType::U16, SaveLoadVersion::MinVersion, SaveLoadVersion::MoreCompanies),
+	SLE_CONDVAR(Town, statues, VarTypes::U16, SaveLoadVersion::MoreCompanies, SaveLoadVersion::MaxVersion),
+
+	SLE_CONDVAR(Town, have_ratings, VarFileType::U8 | VarMemType::U16, SaveLoadVersion::MinVersion, SaveLoadVersion::MoreCompanies),
+	SLE_CONDVAR(Town, have_ratings, VarTypes::U16, SaveLoadVersion::MoreCompanies, SaveLoadVersion::MaxVersion),
+	SLE_CONDARR(Town, ratings, VarTypes::I16, 8, SaveLoadVersion::MinVersion, SaveLoadVersion::MoreCompanies),
+	SLE_CONDARR(Town, ratings, VarTypes::I16, MAX_COMPANIES, SaveLoadVersion::MoreCompanies, SaveLoadVersion::MaxVersion),
+	SLE_CONDARR(Town, unwanted, VarFileType::I8 | VarMemType::U8, 8, SaveLoadVersion::TownTolerancePauseMode, SaveLoadVersion::MoreCompanies),
+	SLE_CONDARR(Town, unwanted, VarFileType::I8 | VarMemType::U8, MAX_COMPANIES, SaveLoadVersion::MoreCompanies, SaveLoadVersion::MaxVersion),
+
+	/* Slots 0 and 2 are passengers and mail respectively for old saves. */
+	SLEG_CONDVAR("supplied[CT_PASSENGERS].old_max", _old_pass_supplied[LAST_MONTH].production, VarFileType::U16 | VarMemType::U32, SaveLoadVersion::MinVersion, SaveLoadVersion::LargerTownCargoStatistics),
+	SLEG_CONDVAR("supplied[CT_PASSENGERS].old_max", _old_pass_supplied[LAST_MONTH].production, VarTypes::U32, SaveLoadVersion::LargerTownCargoStatistics, SaveLoadVersion::ScriptTownGrowth),
+	SLEG_CONDVAR( "supplied[CT_MAIL].old_max", _old_mail_supplied[LAST_MONTH].production, VarFileType::U16 | VarMemType::U32, SaveLoadVersion::MinVersion, SaveLoadVersion::LargerTownCargoStatistics),
+	SLEG_CONDVAR( "supplied[CT_MAIL].old_max", _old_mail_supplied[LAST_MONTH].production, VarTypes::U32, SaveLoadVersion::LargerTownCargoStatistics, SaveLoadVersion::ScriptTownGrowth),
+	SLEG_CONDVAR("supplied[CT_PASSENGERS].new_max", _old_pass_supplied[THIS_MONTH].production, VarFileType::U16 | VarMemType::U32, SaveLoadVersion::MinVersion, SaveLoadVersion::LargerTownCargoStatistics),
+	SLEG_CONDVAR("supplied[CT_PASSENGERS].new_max", _old_pass_supplied[THIS_MONTH].production, VarTypes::U32, SaveLoadVersion::LargerTownCargoStatistics, SaveLoadVersion::ScriptTownGrowth),
+	SLEG_CONDVAR( "supplied[CT_MAIL].new_max", _old_mail_supplied[THIS_MONTH].production, VarFileType::U16 | VarMemType::U32, SaveLoadVersion::MinVersion, SaveLoadVersion::LargerTownCargoStatistics),
+	SLEG_CONDVAR( "supplied[CT_MAIL].new_max", _old_mail_supplied[THIS_MONTH].production, VarTypes::U32, SaveLoadVersion::LargerTownCargoStatistics, SaveLoadVersion::ScriptTownGrowth),
+	SLEG_CONDVAR("supplied[CT_PASSENGERS].old_act", _old_pass_supplied[LAST_MONTH].transported, VarFileType::U16 | VarMemType::U32, SaveLoadVersion::MinVersion, SaveLoadVersion::LargerTownCargoStatistics),
+	SLEG_CONDVAR("supplied[CT_PASSENGERS].old_act", _old_pass_supplied[LAST_MONTH].transported, VarTypes::U32, SaveLoadVersion::LargerTownCargoStatistics, SaveLoadVersion::ScriptTownGrowth),
+	SLEG_CONDVAR( "supplied[CT_MAIL].old_act", _old_mail_supplied[LAST_MONTH].transported, VarFileType::U16 | VarMemType::U32, SaveLoadVersion::MinVersion, SaveLoadVersion::LargerTownCargoStatistics),
+	SLEG_CONDVAR( "supplied[CT_MAIL].old_act", _old_mail_supplied[LAST_MONTH].transported, VarTypes::U32, SaveLoadVersion::LargerTownCargoStatistics, SaveLoadVersion::ScriptTownGrowth),
+	SLEG_CONDVAR("supplied[CT_PASSENGERS].new_act", _old_pass_supplied[THIS_MONTH].transported, VarFileType::U16 | VarMemType::U32, SaveLoadVersion::MinVersion, SaveLoadVersion::LargerTownCargoStatistics),
+	SLEG_CONDVAR("supplied[CT_PASSENGERS].new_act", _old_pass_supplied[THIS_MONTH].transported, VarTypes::U32, SaveLoadVersion::LargerTownCargoStatistics, SaveLoadVersion::ScriptTownGrowth),
+	SLEG_CONDVAR( "supplied[CT_MAIL].new_act", _old_mail_supplied[THIS_MONTH].transported, VarFileType::U16 | VarMemType::U32, SaveLoadVersion::MinVersion, SaveLoadVersion::LargerTownCargoStatistics),
+	SLEG_CONDVAR( "supplied[CT_MAIL].new_act", _old_mail_supplied[THIS_MONTH].transported, VarTypes::U32, SaveLoadVersion::LargerTownCargoStatistics, SaveLoadVersion::ScriptTownGrowth),
+
+	SLE_CONDVARNAME(Town, received[TownAcceptanceEffect::Food].old_act, "received[TE_FOOD].old_act", VarTypes::U16, SaveLoadVersion::MinVersion, SaveLoadVersion::ScriptTownGrowth),
+	SLE_CONDVARNAME(Town, received[TownAcceptanceEffect::Water].old_act, "received[TE_WATER].old_act", VarTypes::U16, SaveLoadVersion::MinVersion, SaveLoadVersion::ScriptTownGrowth),
+	SLE_CONDVARNAME(Town, received[TownAcceptanceEffect::Food].new_act, "received[TE_FOOD].new_act", VarTypes::U16, SaveLoadVersion::MinVersion, SaveLoadVersion::ScriptTownGrowth),
+	SLE_CONDVARNAME(Town, received[TownAcceptanceEffect::Water].new_act, "received[TE_WATER].new_act", VarTypes::U16, SaveLoadVersion::MinVersion, SaveLoadVersion::ScriptTownGrowth),
+
+	SLE_CONDARR(Town, goal, VarTypes::U32, to_underlying(TownAcceptanceEffect::End), SaveLoadVersion::ScriptTownGrowth, SaveLoadVersion::MaxVersion),
+
+	SLE_CONDSSTR(Town, text, VarTypes::STR | StringValidationSetting::AllowControlCode, SaveLoadVersion::ScriptTownText, SaveLoadVersion::MaxVersion),
+
+	SLE_CONDVAR(Town, time_until_rebuild, VarFileType::U8 | VarMemType::U16, SaveLoadVersion::MinVersion, SaveLoadVersion::TownGrowthControl),
+	SLE_CONDVAR(Town, time_until_rebuild, VarTypes::U16, SaveLoadVersion::TownGrowthControl, SaveLoadVersion::MaxVersion),
+	SLE_CONDVAR(Town, grow_counter, VarFileType::U8 | VarMemType::U16, SaveLoadVersion::MinVersion, SaveLoadVersion::TownGrowthControl),
+	SLE_CONDVAR(Town, grow_counter, VarTypes::U16, SaveLoadVersion::TownGrowthControl, SaveLoadVersion::MaxVersion),
+	SLE_CONDVAR(Town, growth_rate, VarFileType::U8 | VarMemType::U16, SaveLoadVersion::MinVersion, SaveLoadVersion::TownGrowthControl),
+	SLE_CONDVAR(Town, growth_rate, VarFileType::I16 | VarMemType::U16, SaveLoadVersion::TownGrowthControl, SaveLoadVersion::ScriptTownGrowth),
+	SLE_CONDVAR(Town, growth_rate, VarTypes::U16, SaveLoadVersion::ScriptTownGrowth, SaveLoadVersion::MaxVersion),
+
+	    SLE_VAR(Town, fund_buildings_months, VarTypes::U8),
+	    SLE_VAR(Town, road_build_months,     VarTypes::U8),
+
+	SLE_CONDVAR(Town, exclusivity, VarTypes::U8, SaveLoadVersion::VehicleCurrencyStationChanges, SaveLoadVersion::MaxVersion),
+	SLE_CONDVAR(Town, exclusive_counter, VarTypes::U8, SaveLoadVersion::VehicleCurrencyStationChanges, SaveLoadVersion::MaxVersion),
+
+	SLE_CONDVAR(Town, larger_town, VarTypes::BOOL, SaveLoadVersion::Cities, SaveLoadVersion::MaxVersion),
+	SLE_CONDVAR(Town, layout, VarTypes::U8, SaveLoadVersion::RoadLayoutPerTown, SaveLoadVersion::MaxVersion),
+	SLE_CONDVAR(Town, valid_history, VarTypes::U64, SaveLoadVersion::TownSupplyHistory, SaveLoadVersion::MaxVersion),
+
+	SLE_CONDREFVECTOR(Town, psa_list, SLRefType::Storage, SaveLoadVersion::PersistentStoragePool, SaveLoadVersion::MaxVersion),
+
+	SLEG_CONDSTRUCTLIST("supplied", SlTownOldSupplied, SaveLoadVersion::ScriptTownGrowth, SaveLoadVersion::TownSupplyHistory),
+	SLEG_CONDSTRUCTLIST("supplied", SlTownSupplied, SaveLoadVersion::TownSupplyHistory, SaveLoadVersion::MaxVersion),
+	SLEG_STRUCTLIST("accepted", SlTownAccepted),
+	SLEG_CONDSTRUCTLIST("received", SlTownReceived, SaveLoadVersion::ScriptTownGrowth, SaveLoadVersion::MaxVersion),
+	SLEG_CONDSTRUCTLIST("acceptance_matrix", SlTownAcceptanceMatrix, SaveLoadVersion::InfrastructureMaintenanceCosts, SaveLoadVersion::RemoveTownCargoCache),
+};
+
+struct HIDSChunkHandler : NewGRFMappingChunkHandler {
+	HIDSChunkHandler() : NewGRFMappingChunkHandler("HIDS", _house_mngr) {}
+};
+
+struct CITYChunkHandler : ChunkHandler {
+	CITYChunkHandler() : ChunkHandler("CITY", ChunkType::Table) {}
+
+	void Save() const override
+	{
+		SlTableHeader(_town_desc);
+
+		for (Town *t : Town::Iterate()) {
+			SlSetArrayIndex(t->index);
+			SlObject(t, _town_desc);
+		}
+	}
+
+	void Load() const override
+	{
+		const std::vector<SaveLoad> slt = SlCompatTableHeader(_town_desc, _town_sl_compat);
+
+		int index;
+
+		while ((index = SlIterateArray()) != -1) {
+			Town *t = Town::CreateAtIndex(TownID(index));
+			SlObject(t, slt);
+
+			if (IsSavegameVersionBefore(SaveLoadVersion::ScriptTownGrowth)) {
+				/* Passengers and mail were always treated as slots 0 and 2 in older saves. */
+				auto &pass = t->supplied.emplace_back(CargoType{0});
+				pass.history[LAST_MONTH] = _old_pass_supplied[LAST_MONTH];
+				pass.history[THIS_MONTH] = _old_pass_supplied[THIS_MONTH];
+				auto &mail = t->supplied.emplace_back(CargoType{2});
+				mail.history[LAST_MONTH] = _old_mail_supplied[LAST_MONTH];
+				mail.history[THIS_MONTH] = _old_mail_supplied[THIS_MONTH];
+			}
+
+			if (IsSavegameVersionBefore(SaveLoadVersion::TownSupplyHistory)) {
+				t->valid_history = 1U << LAST_MONTH;
+			}
+
+			if (t->townnamegrfid.Empty() && !IsInsideMM(t->townnametype, SPECSTR_TOWNNAME_START, SPECSTR_TOWNNAME_END) && GetStringTab(static_cast<StringID>(t->townnametype)) != TEXT_TAB_OLD_CUSTOM) {
+				SlErrorCorrupt("Invalid town name generator");
+			}
+		}
+	}
+
+	void FixPointers() const override
+	{
+		if (IsSavegameVersionBefore(SaveLoadVersion::PersistentStoragePool)) return;
+
+		for (Town *t : Town::Iterate()) {
+			SlObject(t, _town_desc);
+		}
+	}
+};
+
+static const HIDSChunkHandler HIDS;
+static const CITYChunkHandler CITY;
+static const ChunkHandlerRef town_chunk_handlers[] = {
+	HIDS,
+	CITY,
+};
+
+extern const ChunkHandlerTable _town_chunk_handlers(town_chunk_handlers);

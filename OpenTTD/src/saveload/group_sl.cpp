@@ -1,0 +1,66 @@
+/*
+ * This file is part of OpenTTD.
+ * OpenTTD is free software; you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, version 2.
+ * OpenTTD is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details. You should have received a copy of the GNU General Public License along with OpenTTD. If not, see <https://www.gnu.org/licenses/old-licenses/gpl-2.0>.
+ */
+
+/** @file group_sl.cpp Code handling saving and loading of groups. */
+
+#include "../stdafx.h"
+#include "../group.h"
+#include "../company_base.h"
+
+#include "saveload.h"
+#include "compat/group_sl_compat.h"
+
+#include "../safeguards.h"
+
+static const SaveLoad _group_desc[] = {
+	 SLE_CONDVAR(Group, name, VarTypes::NAME, SaveLoadVersion::MinVersion, SaveLoadVersion::ReplaceCustomNameArray),
+	SLE_CONDSSTR(Group, name, VarTypes::STR | StringValidationSetting::AllowControlCode, SaveLoadVersion::ReplaceCustomNameArray, SaveLoadVersion::MaxVersion),
+	     SLE_VAR(Group, owner,              VarTypes::U8),
+	     SLE_VAR(Group, vehicle_type,       VarTypes::U8),
+	     SLE_VAR(Group, flags,              VarTypes::U8),
+	 SLE_CONDVAR(Group, livery.in_use, VarTypes::U8, SaveLoadVersion::GroupLiveries, SaveLoadVersion::MaxVersion),
+	 SLE_CONDVAR(Group, livery.colour1, VarTypes::U8, SaveLoadVersion::GroupLiveries, SaveLoadVersion::MaxVersion),
+	 SLE_CONDVAR(Group, livery.colour2, VarTypes::U8, SaveLoadVersion::GroupLiveries, SaveLoadVersion::MaxVersion),
+	 SLE_CONDVAR(Group, parent, VarTypes::U16, SaveLoadVersion::GroupHierarchy, SaveLoadVersion::MaxVersion),
+	 SLE_CONDVAR(Group, number, VarTypes::U16, SaveLoadVersion::GroupNumbers, SaveLoadVersion::MaxVersion),
+};
+
+struct GRPSChunkHandler : ChunkHandler {
+	GRPSChunkHandler() : ChunkHandler("GRPS", ChunkType::Table) {}
+
+	void Save() const override
+	{
+		SlTableHeader(_group_desc);
+
+		for (Group *g : Group::Iterate()) {
+			SlSetArrayIndex(g->index);
+			SlObject(g, _group_desc);
+		}
+	}
+
+
+	void Load() const override
+	{
+		const std::vector<SaveLoad> slt = SlCompatTableHeader(_group_desc, _group_sl_compat);
+
+		int index;
+
+		while ((index = SlIterateArray()) != -1) {
+			Group *g = Group::CreateAtIndex(GroupID(index));
+			SlObject(g, slt);
+
+			if (IsSavegameVersionBefore(SaveLoadVersion::GroupHierarchy)) g->parent = GroupID::Invalid();
+		}
+	}
+};
+
+static const GRPSChunkHandler GRPS;
+static const ChunkHandlerRef group_chunk_handlers[] = {
+	GRPS,
+};
+
+extern const ChunkHandlerTable _group_chunk_handlers(group_chunk_handlers);

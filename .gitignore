@@ -1,0 +1,5 @@
+build/
+build-host/
+site/
+dist/
+OpenTTD/vendor/
